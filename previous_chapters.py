@@ -4,9 +4,10 @@
 # Code: https://github.com/rasbt/LLMs-from-scratch
 #
 # This file collects all the relevant code that we covered thus far
-# throughout Chapters 2-4.
+# throughout Chapters 2-5.
 # This file can be run as a standalone script.
 
+import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
@@ -167,21 +168,21 @@ class TransformerBlock(nn.Module):
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+        self.drop_resid = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x):
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
         x = self.att(x)   # Shape [batch_size, num_tokens, emb_size]
-        x = self.drop_shortcut(x)
+        x = self.drop_resid(x)
         x = x + shortcut  # Add the original input back
 
         # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
-        x = self.drop_shortcut(x)
+        x = self.drop_resid(x)
         x = x + shortcut  # Add the original input back
 
         return x
@@ -238,42 +239,82 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
 
 
-if __name__ == "__main__":
+#####################################
+# Chapter 5
+#####################################
+def assign(left, right):
+    if left.shape != right.shape:
+        raise ValueError(f"Shape mismatch. Left: {left.shape}, Right: {right.shape}")
+    return torch.nn.Parameter(torch.tensor(right))
 
-    GPT_CONFIG_124M = {
-        "vocab_size": 50257,     # Vocabulary size
-        "context_length": 1024,  # Context length
-        "emb_dim": 768,          # Embedding dimension
-        "n_heads": 12,           # Number of attention heads
-        "n_layers": 12,          # Number of layers
-        "drop_rate": 0.1,        # Dropout rate
-        "qkv_bias": False        # Query-Key-Value bias
-    }
 
-    torch.manual_seed(123)
-    model = GPTModel(GPT_CONFIG_124M)
-    model.eval()  # disable dropout
+def load_weights_into_gpt(gpt, params):
+    gpt.pos_emb.weight = assign(gpt.pos_emb.weight, params["wpe"])
+    gpt.tok_emb.weight = assign(gpt.tok_emb.weight, params["wte"])
 
-    start_context = "Hello, I am"
+    for b in range(len(params["blocks"])):
+        q_w, k_w, v_w = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["w"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.weight = assign(
+            gpt.trf_blocks[b].att.W_query.weight, q_w.T)
+        gpt.trf_blocks[b].att.W_key.weight = assign(
+            gpt.trf_blocks[b].att.W_key.weight, k_w.T)
+        gpt.trf_blocks[b].att.W_value.weight = assign(
+            gpt.trf_blocks[b].att.W_value.weight, v_w.T)
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    encoded = tokenizer.encode(start_context)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
+        q_b, k_b, v_b = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["b"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.bias = assign(
+            gpt.trf_blocks[b].att.W_query.bias, q_b)
+        gpt.trf_blocks[b].att.W_key.bias = assign(
+            gpt.trf_blocks[b].att.W_key.bias, k_b)
+        gpt.trf_blocks[b].att.W_value.bias = assign(
+            gpt.trf_blocks[b].att.W_value.bias, v_b)
 
-    print(f"\n{50*'='}\n{22*' '}IN\n{50*'='}")
-    print("\nInput text:", start_context)
-    print("Encoded input text:", encoded)
-    print("encoded_tensor.shape:", encoded_tensor.shape)
+        gpt.trf_blocks[b].att.out_proj.weight = assign(
+            gpt.trf_blocks[b].att.out_proj.weight,
+            params["blocks"][b]["attn"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].att.out_proj.bias = assign(
+            gpt.trf_blocks[b].att.out_proj.bias,
+            params["blocks"][b]["attn"]["c_proj"]["b"])
 
-    out = generate_text_simple(
-        model=model,
-        idx=encoded_tensor,
-        max_new_tokens=10,
-        context_size=GPT_CONFIG_124M["context_length"]
-    )
-    decoded_text = tokenizer.decode(out.squeeze(0).tolist())
+        gpt.trf_blocks[b].ff.layers[0].weight = assign(
+            gpt.trf_blocks[b].ff.layers[0].weight,
+            params["blocks"][b]["mlp"]["c_fc"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[0].bias = assign(
+            gpt.trf_blocks[b].ff.layers[0].bias,
+            params["blocks"][b]["mlp"]["c_fc"]["b"])
+        gpt.trf_blocks[b].ff.layers[2].weight = assign(
+            gpt.trf_blocks[b].ff.layers[2].weight,
+            params["blocks"][b]["mlp"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[2].bias = assign(
+            gpt.trf_blocks[b].ff.layers[2].bias,
+            params["blocks"][b]["mlp"]["c_proj"]["b"])
 
-    print(f"\n\n{50*'='}\n{22*' '}OUT\n{50*'='}")
-    print("\nOutput:", out)
-    print("Output length:", len(out[0]))
-    print("Output text:", decoded_text)
+        gpt.trf_blocks[b].norm1.scale = assign(
+            gpt.trf_blocks[b].norm1.scale,
+            params["blocks"][b]["ln_1"]["g"])
+        gpt.trf_blocks[b].norm1.shift = assign(
+            gpt.trf_blocks[b].norm1.shift,
+            params["blocks"][b]["ln_1"]["b"])
+        gpt.trf_blocks[b].norm2.scale = assign(
+            gpt.trf_blocks[b].norm2.scale,
+            params["blocks"][b]["ln_2"]["g"])
+        gpt.trf_blocks[b].norm2.shift = assign(
+            gpt.trf_blocks[b].norm2.shift,
+            params["blocks"][b]["ln_2"]["b"])
+
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+    gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
+
+
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # add batch dimension
+    return encoded_tensor
+
+
+def token_ids_to_text(token_ids, tokenizer):
+    flat = token_ids.squeeze(0)  # remove batch dimension
+    return tokenizer.decode(flat.tolist())
